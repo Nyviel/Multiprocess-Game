@@ -99,6 +99,12 @@ int main (void)
     sem_t * client_conn_sem = sem_open("connection_sem", 0);
     if (client_conn_sem == SEM_FAILED) {perror("sem_open client conn"); return 1;}
 
+    sem_t * client_move_sem = sem_open("move_sem", 0);
+    if (client_move_sem == SEM_FAILED) {perror("sem_open client move"); return 1;}
+
+    sem_t * map_refresh_sem = sem_open("refresh_sem", 0);
+    if (map_refresh_sem == SEM_FAILED) {perror("sem_open refresh_sem"); return 1;}
+
     //Look for a place for yourself in the clients array
     
     //If this is met then the server is full and this client cannot join
@@ -148,6 +154,7 @@ int main (void)
             structHandle ->client_data[clientsId - 1].coins_brought = 0;
             structHandle ->client_data[clientsId - 1].coins_carried = 0;
             structHandle ->client_data[clientsId - 1].deaths = 0;
+            sem_post(map_refresh_sem);
             break;
         }
 
@@ -165,6 +172,7 @@ int main (void)
             if (!set)
             {
                 structHandle -> client_data[clientsId - 1].directions[0] = 1;
+                sem_post(client_move_sem);
             }
         }
         
@@ -179,6 +187,7 @@ int main (void)
             if (!set)
             {
                 structHandle -> client_data[clientsId - 1].directions[1] = 1;
+                sem_post(client_move_sem);
             }
         }
 
@@ -193,6 +202,7 @@ int main (void)
             if (!set)
             {
                 structHandle -> client_data[clientsId - 1].directions[2] = 1;
+                sem_post(client_move_sem);
             }
         }
 
@@ -207,6 +217,7 @@ int main (void)
             if (!set)
             {
                 structHandle -> client_data[clientsId - 1].directions[3] = 1;
+                sem_post(client_move_sem);
             }
         }
     }

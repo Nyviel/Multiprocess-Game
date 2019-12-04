@@ -14,10 +14,13 @@
 #define SIGHT_RANGE 5
 #define MAX_BEASTS 200
 
-char map[ROWS][COLUMNS];
 sem_t * client_conn_sem;
+sem_t * client_move_sem;
+sem_t * map_refresh_sem;
+sem_t eh_wake_up_sem;
 pthread_mutex_t myMutex = PTHREAD_MUTEX_INITIALIZER;
 
+char map[ROWS][COLUMNS];
 int campsiteX, campsiteY;
 
 struct coin_bag_t
@@ -131,13 +134,22 @@ int main (void)
         memset((structHandle -> client_data[i]).directions, 0, 4);    
     }
 
-    //Part responsible for listening to new client connections and setting their coordinates
     client_conn_sem = sem_open("connection_sem", O_CREAT, 0600, 0);
     if (client_conn_sem == SEM_FAILED) {perror("sem_open client_conn"); return 1;}
+
+    client_move_sem = sem_open("move_sem", O_CREAT, 0600, 0);
+    if (client_move_sem == SEM_FAILED) {perror("sem_open client move"); return 1;}
+
+    map_refresh_sem = sem_open("refresh_sem", O_CREAT, 0600, 0);
+    if (map_refresh_sem == SEM_FAILED) {perror("sem_open refresh_sem"); return 1;}
+
+    sem_init(&eh_wake_up_sem, 0, 0);
+
+    //Part responsible for listening to new client connections and setting their coordinates
     pthread_t clientConnectionThread;
     pthread_create(&clientConnectionThread, NULL, listen_to_connections, (void *)structHandle);
 
-    // //Part responsible for updating each client, move, send map etc.
+    //Part responsible for updating each client, move, send map etc.
     pthread_t updateClientThread;
     pthread_create(&updateClientThread, NULL, update_client, (void *)structHandle);
     
@@ -166,6 +178,8 @@ int main (void)
         coinBags[i].y = -2;
         coinBags[i].total_coins = 0;
     }
+
+    sem_post(map_refresh_sem);
     //Main game loop
     while (1)
     {
@@ -195,6 +209,7 @@ int main (void)
                 if (map[coinY][coinX] == '-') break;
             }
             map[coinY][coinX] = 'c';
+            sem_post(map_refresh_sem);
         }
 
         //Spawn a small treasure
@@ -209,6 +224,7 @@ int main (void)
                 if (map[treasureY][treasureX] == '-') break;
             }
             map[treasureY][treasureX] = 't';
+            sem_post(map_refresh_sem);
         }
 
         //Spawn a large treasure
@@ -222,10 +238,9 @@ int main (void)
                 if (map[treasureY][treasureX] == '-') break;
             }
             map[treasureY][treasureX] = 'T';
+            sem_post(map_refresh_sem);
         }
 
-
-        //Break if a player has collected X coins
     }
 
     //Clean up the shm
@@ -236,6 +251,11 @@ int main (void)
     //Clean up the semaphores
     sem_close(client_conn_sem);
     sem_unlink("connection_sem");
+    sem_close(client_move_sem);
+    sem_unlink("move_sem");
+    sem_close(map_refresh_sem);
+    sem_unlink("refresh_sem");
+    sem_destroy(&eh_wake_up_sem);
     pthread_mutex_destroy(&myMutex);
     refresh();
     endwin();
@@ -278,6 +298,8 @@ void * print_map(void * arg)
     
     while (1)
     {
+        sem_wait(map_refresh_sem);
+
         for (int i = 0; i < ROWS; i++)
         {
             for (int j = 0; j < COLUMNS; j++)
@@ -439,7 +461,7 @@ void * print_map(void * arg)
         mvprintw(23, 54, "T - Large treasure (50 coins)");
         mvprintw(24, 54, "A - Campsite");
         refresh();
-        sleep(1);
+        usleep(1000);
         clear();
     }
     return NULL;
@@ -454,6 +476,7 @@ void * listen_to_connections(void * arg)
         //Waits for signals from client processes
         //This semaphore will only be triggered if client has found a spot
         sem_wait(client_conn_sem);
+
         //Client has a request
         for (int i = 0; i < MAX_CONNECTIONS; i++)
         {
@@ -474,10 +497,30 @@ void * listen_to_connections(void * arg)
                     }
                     ((struct global_data_t *)arg)->client_data[i].x = x;
                     ((struct global_data_t *)arg)->client_data[i].y = y;
+
+                    //Update the clients partial map
+                    int xrange = -2;
+                    int yrange = -2;
+                    int clientx = ((struct global_data_t *)arg)->client_data[i].x;
+                    int clienty = ((struct global_data_t *)arg)->client_data[i].y;
+                    for (int y = 0; y < SIGHT_RANGE; y++)
+                    {
+                        for (int x = 0; x < SIGHT_RANGE; x++)
+                        {
+                            int xparam = clientx + (xrange + x);
+                            int yparam = clienty + (yrange + y);
+                            if (xparam < 0) xparam = 0;
+                            if (xparam >= COLUMNS) xparam = COLUMNS - 1;
+                            if (yparam < 0) yparam = 0;
+                            if (yparam > ROWS) yparam = ROWS - 1; 
+                            ((struct global_data_t *)arg)->client_data[i].map_part[y][x] = map[yparam][xparam];
+                        }
+                    }
                     break;
                 }
             }
         }
+        sem_post(map_refresh_sem);
     }
     return NULL;
 }
@@ -487,17 +530,28 @@ void * update_client(void * arg)
 {
     while (1)
     {
+        //Wait for request
+        sem_wait(client_move_sem);
+
         //Move client part
         for (int i = 0; i < MAX_CONNECTIONS; i++)
         {
+            int inbush = 0;
+            //If this client is connected
             if (((struct global_data_t *)arg)->connected_clients[i])
             {
-                //Bush penalty
-                if (((struct global_data_t *)arg)->client_data[i].in_bush)
-                {
-                    ((struct global_data_t *)arg)->client_data[i].in_bush = 0;
-                    continue;
-                }
+                // //Check for bush penalty
+                // if (map[((struct global_data_t *)arg)->client_data[i].y][((struct global_data_t *)arg)->client_data[i].x] == '#')
+                // {
+                //     ((struct global_data_t *)arg)->client_data[i].in_bush = 1;
+                // }
+                // //Bush penalty
+                // if (((struct global_data_t *)arg)->client_data[i].in_bush)
+                // {
+                //     //Wait for one second
+                //     ((struct global_data_t *)arg)->client_data[i].in_bush = 0;
+                //     inbush = 1;
+                // }
 
                 //Check for the direction array for each connected client, perhaps they requested a move
                 for (int j = 0; j < 4; j++)
@@ -516,7 +570,7 @@ void * update_client(void * arg)
                                 break;    
                             }
                             
-                            ((struct global_data_t *)arg)->client_data[i].y -= 1;
+                            if (!inbush) ((struct global_data_t *)arg)->client_data[i].y -= 1;
                         }
                         else if (j == 1) //Requested east
                         {
@@ -528,7 +582,7 @@ void * update_client(void * arg)
                             {
                                 break;    
                             }
-                            ((struct global_data_t *)arg)->client_data[i].x += 1;
+                            if (!inbush) ((struct global_data_t *)arg)->client_data[i].x += 1;
                         }
                         else if (j == 2) //Requested west
                         {
@@ -540,7 +594,7 @@ void * update_client(void * arg)
                             {
                                 break;    
                             }
-                            ((struct global_data_t *)arg)->client_data[i].x -= 1;
+                            if (!inbush) ((struct global_data_t *)arg)->client_data[i].x -= 1;
                         }
                         else if (j == 3) //Requested south
                         {
@@ -552,14 +606,10 @@ void * update_client(void * arg)
                             {
                                 break;    
                             }
-                            ((struct global_data_t *)arg)->client_data[i].y += 1;       
+                            if (!inbush) ((struct global_data_t *)arg)->client_data[i].y += 1;       
                         }
                     }
-                    //Check for bush penalty
-                    if (map[((struct global_data_t *)arg)->client_data[i].y][((struct global_data_t *)arg)->client_data[i].x] == '#')
-                    {
-                        ((struct global_data_t *)arg)->client_data[i].in_bush = 1;
-                    }
+
                 }
 
                 //Update the clients partial map
@@ -582,10 +632,11 @@ void * update_client(void * arg)
                 }
             } 
         }
-
-        //Sleep to not consume too many cpu cycles
-        if (((struct global_data_t *)arg)->current_connections) ((struct global_data_t *)arg) -> round++;
         sleep(1);
+
+        if (((struct global_data_t *)arg)->current_connections) ((struct global_data_t *)arg) -> round++;
+        sem_post(&eh_wake_up_sem);
+        sem_post(map_refresh_sem);
     }
     return NULL;
 }
@@ -595,6 +646,7 @@ void * event_handler(void * arg)
 {
     while (1)
     {
+        sem_wait(&eh_wake_up_sem);
         for (int i = 0; i < MAX_CONNECTIONS; i++)
         {
             //If this was met there is a client to check
@@ -706,6 +758,7 @@ void * event_handler(void * arg)
             }
         }
         usleep(50000);
+        sem_post(map_refresh_sem);
     }
 
     return NULL;
@@ -935,6 +988,7 @@ void * wild_beast(void * arg)
                 }
             }
         }
+        sem_post(map_refresh_sem);
 
         sleep(1);
     }
